@@ -82,7 +82,12 @@ check("'enabledPlugins' does not appear in the store", !allBytes.includes("enabl
 check("filenames are opaque — no SKILL.md in any path", !storeFiles.some((f) => /SKILL\.md|CLAUDE\.md|settings\.json/.test(f)));
 check("skill names are not exposed as paths", !storeFiles.some((f) => f.includes("secret-skill")));
 check("project paths (which carry a username) are not exposed", !storeFiles.some((f) => f.includes("C--Users-someone")));
-check("blobs are named as opaque hex", storeFiles.filter((f) => f.endsWith(".bin")).every((f) => /[0-9a-f]{64}\.bin$/.test(f)));
+const payloadBlobs = storeFiles.filter((f) => f.includes(`${path.sep}payload${path.sep}`));
+check("payload blobs are named as opaque hex", payloadBlobs.length > 0 && payloadBlobs.every((f) => /[0-9a-f]{64}\.bin$/.test(f)));
+const machineBlobs = storeFiles.filter((f) => f.includes(`${path.sep}machines${path.sep}`));
+check("machine records are sealed (.bin, not .json)", machineBlobs.length > 0 && machineBlobs.every((f) => f.endsWith(".bin")), machineBlobs.join(", "));
+check("machine record filenames do not leak the machine name", !machineBlobs.some((f) => /\bA\b|desktop|laptop/i.test(path.basename(f))));
+check("machine names are not readable in the store", !allBytes.includes("\"machine\": \"A\""));
 check("the sync log is encrypted too", !fs.readFileSync(path.join(STORE, "logs", "sync-log.jsonl")).includes("settings.json"));
 check("store.json records that it is encrypted", JSON.parse(fs.readFileSync(path.join(STORE, "store.json"), "utf8")).encrypted === true);
 
@@ -120,15 +125,15 @@ fs.mkdirSync(D, { recursive: true });
 const tamperStore = path.join(ROOT, "cloud-tamper");
 fs.cpSync(STORE, tamperStore, { recursive: true });
 const victim = [];
-walkAll.length; // keep linter quiet
 (function collect(dir) {
 	for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
 		const p = path.join(dir, e.name);
 		if (e.isDirectory()) collect(p);
-		else if (p.endsWith(".bin")) victim.push(p);
+		// Only a payload blob — a machine record has its own failure path.
+		else if (p.endsWith(".bin") && p.includes(`${path.sep}payload${path.sep}`)) victim.push(p);
 	}
 })(tamperStore);
-const target = victim[0];
+const target = victim.sort()[0];
 const bytes = fs.readFileSync(target);
 bytes[bytes.length - 1] ^= 0xff; // flip one bit of ciphertext
 fs.writeFileSync(target, bytes);

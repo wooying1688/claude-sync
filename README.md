@@ -177,6 +177,67 @@ node claude-sync.mjs pull --prune         # also delete local files absent from 
 After a pull that changed `known_marketplaces.json`, run `/plugin` in Claude Code to install
 the plugins the new declarations ask for.
 
+## Machines and sizes
+
+Every push and pull records a row for the machine that ran it, kept in the store so each
+computer can see all the others. `claude-sync machines` shows who is in the sync, how much each
+holds, and when each last synced:
+
+```
+Store — C:\Users\you\OneDrive\claude-sync
+  4 file(s), 5.2 KB  (encrypted)
+
+Machines syncing here (2)
+  machine              files     size   last push      last pull
+* desktop-win            4   5.2 KB   just now       never
+  macbook-air            4   5.2 KB   never          just now
+
+* this machine
+```
+
+Rows are one file per machine (`machines/<id>.bin`), so two computers syncing at once never
+write the same file. The id is random and the contents are encrypted with everything else, so
+the store does not reveal your machine names either. Renaming a machine keeps its row and its
+history rather than creating a second one, and `machines --verbose` adds platform and Node
+version. `machines --json` prints the same data for scripting, and nothing else.
+
+`status` reports the size difference between this machine and the store, then what is pending
+in each direction with a per-file delta:
+
+```
+Size
+  local:     6 file(s),   7.2 KB
+  store:     4 file(s),   5.2 KB
+  diff:   +2.0 KB
+
+Local → store (pending push)
+  2 added, 4 unchanged
+    add    2.0 KB  CLAUDE.md
+    add       8 B  commands/ship.md
+         2 file(s), +2.0 KB net
+```
+
+A changed file shows its new size and how much it grew or shrank against the stored copy, so a
+file that suddenly gains a megabyte is visible before you push it.
+
+### Adding a new computer
+
+`init` asks for a name for the computer, and once it can reach the store it lists the machines
+already in the sync so you can tell them apart in the log:
+
+```
+This sync already has 2 machines:
+  desktop-win  — last pushed 4h ago
+  macbook-air  — last pushed 2d ago
+  give this computer its own name so you can tell them apart in the log
+
+Name for this computer [DESKTOP-ABC]: work-laptop
+```
+
+Reusing a name that is already in the sync has to be confirmed, since it would make the log
+ambiguous — handy when you have genuinely rebuilt a machine and want to keep the old name.
+Matching ignores case. If the store cannot be reached, naming still works.
+
 ## Sync logs
 
 Every run appends one line to `<store>/logs/sync-log.jsonl` — encrypted per line when
@@ -227,7 +288,8 @@ Each entry records the operation, machine, timestamp, backend, duration, per-fil
 | `remote --url <git-url>` | attach or change the git remote later |
 | `push [--dry-run] [--verbose]` | copy local config to the store |
 | `pull [--dry-run] [--verbose] [--prune]` | apply the store to local config |
-| `status` | pending changes in both directions |
+| `status` | sizes, the difference, pending changes both ways, and every machine |
+| `machines [--verbose] [--json]` | every computer in the sync: file count, size, last push and pull |
 | `log [...]` | review what has been synced |
 | `backups [--restore <id>]` | list or restore pre-pull backups |
 | `doctor` | resolved paths, sync scope, size, encryption state, secret check |
@@ -243,11 +305,12 @@ Each entry records the operation, machine, timestamp, backend, duration, per-fil
 ## Tests
 
 ```bash
-npm test                    # all four suites, 79 checks
+npm test                    # all five suites, 111 checks
 
 node test-roundtrip.mjs     # path tokenization, including cross-OS (13 checks)
 node test-interactive.mjs   # the setup prompts, with scripted answers (20 checks)
-node test-crypto.mjs        # encryption, wrong passphrase, tampering, leakage (30 checks)
+node test-crypto.mjs        # encryption, wrong passphrase, tampering, leakage (33 checks)
+node test-machines.mjs      # the registry, size reporting, naming a new computer (30 checks)
 node test-e2e.mjs           # two-machine push/pull through a folder backend (31 checks)
 ```
 

@@ -204,6 +204,32 @@ function writeAtomic(dest, buf) {
 	fs.renameSync(tmp, dest);
 }
 
+function human(bytes) {
+	if (bytes === 0) return "0 B";
+	const units = ["B", "KB", "MB", "GB"];
+	const i = Math.min(Math.floor(Math.log(Math.abs(bytes)) / Math.log(1024)), units.length - 1);
+	const n = bytes / 1024 ** i;
+	return `${n.toFixed(i === 0 ? 0 : n < 10 ? 1 : 0)} ${units[i]}`;
+}
+
+function signed(bytes) {
+	if (!bytes) return "±0";
+	return `${bytes > 0 ? "+" : "−"}${human(Math.abs(bytes))}`;
+}
+
+function since(iso) {
+	if (!iso) return "never";
+	const ms = Date.now() - new Date(iso).getTime();
+	if (!Number.isFinite(ms)) return "never";
+	const mins = Math.floor(ms / 60000);
+	if (mins < 1) return "just now";
+	if (mins < 60) return `${mins}m ago`;
+	const hours = Math.floor(mins / 60);
+	if (hours < 24) return `${hours}h ago`;
+	const days = Math.floor(hours / 24);
+	return days < 30 ? `${days}d ago` : `${Math.floor(days / 30)}mo ago`;
+}
+
 function readIfExists(p) {
 	try {
 		return fs.readFileSync(p);
@@ -508,6 +534,60 @@ function openStore(cfg, keys) {
 	};
 }
 
+// ------------------------------------------------- machine registry
+
+// One file per machine, named by a random id, so two machines syncing at once
+// never write the same file — and the id reveals nothing about the machine.
+// Encrypted stores seal the contents; the filename is already opaque.
+function machinesDir(cfg) {
+	return path.join(storeDir(cfg), "machines");
+}
+
+function machineRecordPath(cfg, machineId, encrypted) {
+	return path.join(machinesDir(cfg), `${machineId}.${encrypted ? "bin" : "json"}`);
+}
+
+function writeMachineRecord(cfg, keys, record) {
+	const p = machineRecordPath(cfg, record.id, !!keys);
+	const json = Buffer.from(`${JSON.stringify(record, null, 2)}\n`, "utf8");
+	writeAtomic(p, keys ? seal(keys.content, json, Buffer.from(path.basename(p))) : json);
+}
+
+function readMachineRecords(cfg, keys) {
+	const dir = machinesDir(cfg);
+	if (!fs.existsSync(dir)) return [];
+	const out = [];
+	for (const name of walk(dir)) {
+		const raw = readIfExists(path.join(dir, name));
+		if (!raw) continue;
+		try {
+			const json = keys && name.endsWith(".bin") ? unseal(keys.content, raw, Buffer.from(name)) : raw;
+			out.push(JSON.parse(json.toString("utf8")));
+		} catch {
+			out.push({ id: name.replace(/\.(bin|json)$/, ""), machine: "(unreadable)", unreadable: true });
+		}
+	}
+	return out.sort((a, b) => String(a.machine).localeCompare(String(b.machine)));
+}
+
+// Called after every push and pull so each machine's row stays current.
+function recordThisMachine(cfg, keys, { op, files, bytes, at }) {
+	const existing = readMachineRecords(cfg, keys).find((m) => m.id === cfg.machineId) || {};
+	writeMachineRecord(cfg, keys, {
+		...existing,
+		id: cfg.machineId,
+		machine: cfg.machine,
+		platform: `${os.platform()} ${os.release()}`,
+		node: process.version,
+		transcripts: !!cfg.include?.transcripts,
+		files,
+		bytes,
+		lastPush: op === "push" ? at : existing.lastPush || null,
+		lastPull: op === "pull" ? at : existing.lastPull || null,
+		updatedAt: at,
+	});
+}
+
 // ---------------------------------------------------------------- config
 
 function loadConfig({ required = true } = {}) {
@@ -516,7 +596,12 @@ function loadConfig({ required = true } = {}) {
 		if (required) fail("Not configured yet. Run: claude-sync init --help");
 		return null;
 	}
-	return JSON.parse(raw.toString("utf8"));
+	const cfg = JSON.parse(raw.toString("utf8"));
+	if (!cfg.machineId) {
+		cfg.machineId = randomUUID(); // config written before machine ids existed
+		saveConfig(cfg);
+	}
+	return cfg;
 }
 
 function saveConfig(cfg) {
@@ -676,11 +761,16 @@ function doPush(cfg, keys, { dryRun }) {
 
 		const existing = current.get(rel);
 		if (existing && sha256(existing) === sha256(buf)) {
-			actions.push({ file: rel, action: "unchanged" });
+			actions.push({ file: rel, action: "unchanged", bytes: buf.length });
 			continue;
 		}
 		if (!dryRun) store.write(rel, buf);
-		actions.push({ file: rel, action: existing ? "updated" : "added", bytes: buf.length });
+		actions.push({
+			file: rel,
+			action: existing ? "updated" : "added",
+			bytes: buf.length,
+			delta: buf.length - (existing?.length ?? 0),
+		});
 	}
 	if (!dryRun) writeStoreMeta(cfg);
 	return actions;
@@ -705,25 +795,30 @@ function doPull(cfg, keys, { dryRun, prune }) {
 		const target = path.join(CLAUDE_DIR, rel);
 		const existing = readIfExists(target);
 		if (existing && sha256(existing) === sha256(buf)) {
-			actions.push({ file: rel, action: "unchanged" });
+			actions.push({ file: rel, action: "unchanged", bytes: buf.length });
 			continue;
 		}
 		if (!dryRun) {
 			if (existing) writeAtomic(path.join(backupRoot, rel), existing);
 			writeAtomic(target, buf);
 		}
-		actions.push({ file: rel, action: existing ? "updated" : "added", bytes: buf.length });
+		actions.push({
+			file: rel,
+			action: existing ? "updated" : "added",
+			bytes: buf.length,
+			delta: buf.length - (existing?.length ?? 0),
+		});
 	}
 
 	if (prune) {
 		for (const rel of localFiles(cfg)) {
 			if (incoming.has(rel)) continue;
+			const existing = readIfExists(path.join(CLAUDE_DIR, rel));
 			if (!dryRun) {
-				const existing = readIfExists(path.join(CLAUDE_DIR, rel));
 				if (existing) writeAtomic(path.join(backupRoot, rel), existing);
 				fs.rmSync(path.join(CLAUDE_DIR, rel), { force: true });
 			}
-			actions.push({ file: rel, action: "deleted" });
+			actions.push({ file: rel, action: "deleted", bytes: 0, delta: -(existing?.length ?? 0) });
 		}
 	}
 
@@ -741,6 +836,7 @@ function printActions(actions, { verbose }) {
 	const counts = summarize(actions);
 	const parts = Object.entries(counts).map(([k, v]) => `${v} ${k}`);
 	log.info(parts.length ? parts.join(", ") : "no files matched");
+
 	const notable = actions.filter((a) => a.action !== "unchanged");
 	for (const a of verbose ? actions : notable) {
 		const tag =
@@ -751,8 +847,21 @@ function printActions(actions, { verbose }) {
 					: a.action === "unchanged"
 						? `\x1b[2msame\x1b[0m`
 						: `\x1b[32m${a.action === "added" ? "add " : "upd "}\x1b[0m`;
-		log.dim(`  ${tag} ${a.file}${a.reason ? `  — ${a.reason}` : ""}`);
+		const size =
+			a.action === "skipped"
+				? ""
+				: a.action === "added" || a.action === "deleted"
+					? ` ${human(a.bytes ?? 0).padStart(8)}`
+					: ` ${human(a.bytes ?? 0).padStart(8)} ${signed(a.delta ?? 0)}`;
+		log.dim(`  ${tag}${size}  ${a.file}${a.reason ? `  — ${a.reason}` : ""}`);
 	}
+
+	const moved = notable.filter((a) => a.action !== "skipped");
+	if (moved.length) {
+		const totalDelta = moved.reduce((sum, a) => sum + (a.delta ?? 0), 0);
+		log.dim(`  ${"".padEnd(4)} ${moved.length} file(s), ${signed(totalDelta)} net`);
+	}
+
 	const skipped = actions.filter((a) => a.action === "skipped");
 	if (skipped.length) log.warn(`${skipped.length} file(s) withheld — secret-like content, not synced`);
 }
@@ -797,7 +906,9 @@ export function detectStores() {
 }
 
 // `ask` is injected by the tests; the CLI builds a readline-backed one.
-export async function interactiveInit(ask) {
+// `lookupMachines` is called once the destination is known, to show which
+// computers are already in this sync before naming a new one.
+export async function interactiveInit(ask, lookupMachines) {
 	let rl = null;
 	if (!ask) {
 		if (!process.stdin.isTTY || !process.stdout.isTTY) {
@@ -861,9 +972,6 @@ export async function interactiveInit(ask) {
 			backend = { type: "folder", path: path.resolve(dir.replace(/^~(?=[/\\])/, HOME)) };
 		}
 
-		const machineDefault = os.hostname();
-		const machine = (await ask(`Name for this machine [${machineDefault}]: `)).trim() || machineDefault;
-
 		log.dim("\nSession transcripts are your full conversation history: large, and not mergeable");
 		log.dim("across machines. They are excluded unless you ask for them.");
 		const wantTranscripts = (await ask("Include session transcripts? [y/N] ")).trim().toLowerCase();
@@ -874,6 +982,36 @@ export async function interactiveInit(ask) {
 		log.dim("You will need the passphrase on every machine. It cannot be recovered.");
 		const wantEncryption = (await ask("Encrypt the stored files? [Y/n] ")).trim().toLowerCase();
 		const encrypt = !(wantEncryption === "n" || wantEncryption === "no");
+
+		// Naming comes last: only now can we read the store and show who is in it.
+		let taken = [];
+		if (lookupMachines) {
+			try {
+				taken = (await lookupMachines({ backend, encrypt })) ?? [];
+			} catch {
+				taken = [];
+			}
+		}
+		if (taken.length) {
+			console.log(`\n\x1b[1mThis sync already has ${taken.length} machine${taken.length === 1 ? "" : "s"}:\x1b[0m`);
+			for (const m of taken) log.dim(`  ${m.machine}${m.lastPush ? `  — last pushed ${since(m.lastPush)}` : ""}`);
+			log.dim("  give this computer its own name so you can tell them apart in the log");
+		}
+
+		const machineDefault = os.hostname();
+		const names = new Set(taken.map((m) => String(m.machine).toLowerCase()));
+		let machine = "";
+		while (!machine) {
+			const answer = (await ask(`\nName for this computer [${machineDefault}]: `)).trim() || machineDefault;
+			if (!names.has(answer.toLowerCase())) {
+				machine = answer;
+				break;
+			}
+			// A duplicate name would make the log ambiguous, so confirm it is intended.
+			const sure = (await ask(`"${answer}" is already in this sync. Use it anyway? [y/N] `)).trim().toLowerCase();
+			if (sure === "y" || sure === "yes") machine = answer;
+			else log.warn("pick a different name");
+		}
 
 		return { backend, machine, transcripts, encrypt };
 	} finally {
@@ -892,7 +1030,15 @@ const commands = {
 		// No --backend means the user did not tell us where to put things, so ask.
 		let chosen;
 		if (!args.backend) {
-			chosen = await interactiveInit();
+			chosen = await interactiveInit(undefined, async ({ backend, encrypt }) => {
+				const probe = { backend, encryption: { enabled: encrypt }, machineId: null };
+				backends[backend.type].prepare(probe);
+				backends[backend.type].refresh(probe);
+				const meta = readStoreMeta(probe);
+				if (meta) probe.encryption.enabled = meta.encrypted;
+				if (!fs.existsSync(machinesDir(probe))) return [];
+				return readMachineRecords(probe, await resolveKeys(probe));
+			});
 		} else {
 			const type = args.backend;
 			if (!["folder", "git"].includes(type))
@@ -915,6 +1061,8 @@ const commands = {
 			version: 1,
 			backend: chosen.backend,
 			machine: chosen.machine,
+			// Stable per install, so renaming the machine keeps its history.
+			machineId: existing?.machineId || randomUUID(),
 			include: { transcripts: chosen.transcripts },
 			encryption: { enabled: !!chosen.encrypt, cipher: "aes-256-gcm", kdf: "scrypt" },
 			created: new Date().toISOString(),
@@ -935,6 +1083,7 @@ const commands = {
 		if (cfg.backend.type === "folder")
 			log.dim("your cloud client syncs that folder — nothing else to set up");
 		log.dim(`machine: ${cfg.machine}   transcripts: ${cfg.include.transcripts ? "included" : "excluded"}`);
+		log.dim(`machine id: ${cfg.machineId}`);
 		log.dim(`encryption: ${cfg.encryption.enabled ? "on (AES-256-GCM)" : "off"}`);
 		log.dim(`config:  ${CONFIG_PATH}`);
 		log.info("");
@@ -986,6 +1135,13 @@ const commands = {
 			files: actions.filter((a) => a.action !== "unchanged"),
 		};
 		appendLog(cfg, entry, keys);
+		const synced = actions.filter((a) => a.action !== "skipped");
+		recordThisMachine(cfg, keys, {
+			op: "push",
+			at: entry.at,
+			files: synced.length,
+			bytes: synced.reduce((sum, a) => sum + (a.bytes ?? 0), 0),
+		});
 		backends[cfg.backend.type].finalize(cfg, `claude-sync push from ${cfg.machine} (${entry.id})`);
 		cfg.lastPush = entry.at;
 		saveConfig(cfg);
@@ -1019,6 +1175,13 @@ const commands = {
 			files: actions.filter((a) => a.action !== "unchanged"),
 		};
 		appendLog(cfg, entry, keys);
+		const applied = actions.filter((a) => a.action !== "deleted");
+		recordThisMachine(cfg, keys, {
+			op: "pull",
+			at: entry.at,
+			files: applied.length,
+			bytes: applied.reduce((sum, a) => sum + (a.bytes ?? 0), 0),
+		});
 		if (cfg.backend.type === "git") backends.git.finalize(cfg, `claude-sync pull log from ${cfg.machine} (${entry.id})`);
 		cfg.lastPull = entry.at;
 		saveConfig(cfg);
@@ -1039,21 +1202,106 @@ const commands = {
 		log.info(`last pull: ${cfg.lastPull || "never"}`);
 
 		const pending = doPush(cfg, keys, { dryRun: true });
+		const incoming = openStore(cfg, keys).readAll();
+
+		let localBytes = 0;
+		for (const a of pending) if (a.action !== "skipped") localBytes += a.bytes ?? 0;
+		let storeBytes = 0;
+		for (const buf of incoming.values()) storeBytes += buf.length;
+
+		log.head("Size");
+		log.info(`local:  ${String(pending.filter((a) => a.action !== "skipped").length).padStart(4)} file(s), ${human(localBytes).padStart(8)}`);
+		log.info(`store:  ${String(incoming.size).padStart(4)} file(s), ${human(storeBytes).padStart(8)}`);
+		log.info(`diff:   ${signed(localBytes - storeBytes)}`);
+
 		log.head("Local → store (pending push)");
 		printActions(pending, { verbose: false });
 
-		const incoming = openStore(cfg, keys).readAll();
 		if (incoming.size) {
 			const drift = [];
 			for (const rel of [...incoming.keys()].sort()) {
 				let buf = incoming.get(rel);
 				if (REWRITE.has(rel)) buf = detokenize(buf);
 				const local = readIfExists(path.join(CLAUDE_DIR, rel));
-				if (!local) drift.push({ file: rel, action: "added" });
-				else if (sha256(local) !== sha256(buf)) drift.push({ file: rel, action: "updated" });
+				if (!local) drift.push({ file: rel, action: "added", bytes: buf.length, delta: buf.length });
+				else if (sha256(local) !== sha256(buf))
+					drift.push({ file: rel, action: "updated", bytes: buf.length, delta: buf.length - local.length });
 			}
 			log.head("Store → local (pending pull)");
 			printActions(drift, { verbose: false });
+		}
+
+		const records = readMachineRecords(cfg, keys);
+		if (records.length) {
+			log.head(`Machines (${records.length})`);
+			for (const m of records) {
+				const mine = m.id === cfg.machineId ? "*" : " ";
+				if (m.unreadable) continue;
+				log.info(
+					`${mine} ${String(m.machine).slice(0, 18).padEnd(18)} ${human(m.bytes ?? 0).padStart(8)}   ` +
+						`pushed ${since(m.lastPush)}, pulled ${since(m.lastPull)}`,
+				);
+			}
+			log.dim("  full detail:  claude-sync machines");
+		}
+	},
+
+	async machines(args) {
+		const cfg = loadConfig();
+		backends[cfg.backend.type].prepare(cfg);
+		backends[cfg.backend.type].refresh(cfg);
+		const keys = await resolveKeys(cfg);
+		const records = readMachineRecords(cfg, keys);
+
+		const storeFiles = openStore(cfg, keys).readAll();
+		let storeBytes = 0;
+		for (const buf of storeFiles.values()) storeBytes += buf.length;
+
+		// --json must emit nothing but JSON, so it comes before any output.
+		if (args.json) {
+			console.log(
+				JSON.stringify(
+					{
+						store: { path: storeDir(cfg), files: storeFiles.size, bytes: storeBytes, encrypted: !!keys },
+						machines: records,
+					},
+					null,
+					2,
+				),
+			);
+			return;
+		}
+
+		log.head(`Store — ${storeDir(cfg)}`);
+		log.info(`${storeFiles.size} file(s), ${human(storeBytes)}${keys ? "  (encrypted)" : ""}`);
+
+		log.head(`Machines syncing here (${records.length})`);
+		if (!records.length) {
+			log.dim("  none recorded yet — run push or pull on a machine to register it");
+			return;
+		}
+
+		log.dim("  machine              files     size   last push      last pull");
+		for (const m of records) {
+			const mine = m.id === cfg.machineId;
+			const name = `${mine ? "*" : " "} ${String(m.machine).slice(0, 18).padEnd(18)}`;
+			if (m.unreadable) {
+				log.warn(`${name} (cannot decrypt this record)`);
+				continue;
+			}
+			log.info(
+				`${name} ${String(m.files ?? "?").padStart(5)} ${human(m.bytes ?? 0).padStart(8)}   ` +
+					`${since(m.lastPush).padEnd(14)} ${since(m.lastPull)}`,
+			);
+		}
+		log.dim("\n  * this machine");
+		const stale = records.filter((m) => !m.unreadable && m.lastPull && Date.parse(m.lastPull) < Date.now() - 30 * 864e5);
+		if (stale.length) log.warn(`${stale.length} machine(s) have not pulled in over 30 days`);
+		if (args.verbose) {
+			log.head("Detail");
+			for (const m of records)
+				if (!m.unreadable)
+					log.dim(`  ${m.machine}: ${m.platform || "?"}, node ${m.node || "?"}, transcripts ${m.transcripts ? "on" : "off"}`);
 		}
 	},
 
@@ -1184,7 +1432,8 @@ Usage
 
   claude-sync push      [--dry-run] [--verbose]      local  → store
   claude-sync pull      [--dry-run] [--verbose] [--prune]   store → local (backs up first)
-  claude-sync status                                 what differs in each direction
+  claude-sync status                                 sizes, what differs, and every machine
+  claude-sync machines  [--verbose] [--json]         every computer in the sync, size and last sync
   claude-sync log       [--limit N] [--machine M] [--op push|pull] [--since DATE] [--json]
   claude-sync log       --files <id>                 per-file detail for one run
   claude-sync backups   [--restore <id>]             pre-pull backups
