@@ -5,7 +5,16 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
-import { createHash, randomUUID } from "node:crypto";
+import {
+	createCipheriv,
+	createDecipheriv,
+	createHash,
+	createHmac,
+	hkdfSync,
+	randomBytes,
+	randomUUID,
+	scryptSync,
+} from "node:crypto";
 import { execFileSync } from "node:child_process";
 import * as readline from "node:readline/promises";
 
@@ -232,6 +241,273 @@ function detokenize(buf) {
 	return Buffer.from(t, "utf8");
 }
 
+// ---------------------------------------------------------------- crypto
+
+// Envelope encryption: a random 32-byte data key encrypts the files, and a
+// passphrase-derived key encrypts the data key. The wrapped data key lives in
+// the store, so any machine that knows the passphrase can read what the others
+// wrote, and the passphrase can change without re-encrypting every file.
+const KDF_DEFAULTS = { name: "scrypt", N: 1 << 16, r: 8, p: 1, keyLen: 32 };
+const SCRYPT_MAXMEM = 256 * 1024 * 1024; // N=2^16,r=8 needs ~64MB; Node defaults to 32MB
+const AAD_KEYRING = Buffer.from("claude-sync/keyring/v1");
+const AAD_LOG = Buffer.from("claude-sync/log/v1");
+const IV_LEN = 12;
+const TAG_LEN = 16;
+
+function deriveKek(passphrase, salt, kdf = KDF_DEFAULTS) {
+	if (kdf.name !== "scrypt") fail(`unsupported key-derivation function in store: ${kdf.name}`);
+	// NFKC so the same typed passphrase derives the same key on every platform.
+	return scryptSync(passphrase.normalize("NFKC"), salt, kdf.keyLen ?? 32, {
+		N: kdf.N,
+		r: kdf.r,
+		p: kdf.p,
+		maxmem: SCRYPT_MAXMEM,
+	});
+}
+
+// Separate keys for content and for filename HMACs, so one never doubles as the other.
+function subkey(dataKey, label) {
+	return Buffer.from(hkdfSync("sha256", dataKey, Buffer.alloc(0), Buffer.from(label), 32));
+}
+
+function seal(key, plaintext, aad) {
+	const iv = randomBytes(IV_LEN); // fresh per write — never reused with this key
+	const cipher = createCipheriv("aes-256-gcm", key, iv);
+	if (aad) cipher.setAAD(aad);
+	const ct = Buffer.concat([cipher.update(plaintext), cipher.final()]);
+	return Buffer.concat([iv, cipher.getAuthTag(), ct]);
+}
+
+function unseal(key, blob, aad) {
+	if (blob.length < IV_LEN + TAG_LEN) throw new Error("ciphertext is truncated");
+	const decipher = createDecipheriv("aes-256-gcm", key, blob.subarray(0, IV_LEN));
+	if (aad) decipher.setAAD(aad);
+	decipher.setAuthTag(blob.subarray(IV_LEN, IV_LEN + TAG_LEN));
+	// Throws if the key is wrong or a single byte was altered.
+	return Buffer.concat([decipher.update(blob.subarray(IV_LEN + TAG_LEN)), decipher.final()]);
+}
+
+function keyringPath(cfg) {
+	return path.join(storeDir(cfg), "keyring.json");
+}
+
+function createKeyring(passphrase) {
+	const salt = randomBytes(16);
+	const dataKey = randomBytes(32);
+	const kek = deriveKek(passphrase, salt);
+	return {
+		keyring: {
+			v: 1,
+			kdf: { ...KDF_DEFAULTS, salt: salt.toString("base64") },
+			wrapped: seal(kek, dataKey, AAD_KEYRING).toString("base64"),
+		},
+		dataKey,
+	};
+}
+
+function unwrapKeyring(keyring, passphrase) {
+	const { salt, ...kdf } = keyring.kdf;
+	const kek = deriveKek(passphrase, Buffer.from(salt, "base64"), kdf);
+	try {
+		return unseal(kek, Buffer.from(keyring.wrapped, "base64"), AAD_KEYRING);
+	} catch {
+		fail("wrong passphrase for this store (nothing was changed)");
+	}
+}
+
+// Deterministic so the same file maps to the same store entry on every machine
+// and every run; keyed so the store never reveals which files you have.
+function blobName(pathKey, rel) {
+	return `${createHmac("sha256", pathKey).update(rel, "utf8").digest("hex")}.bin`;
+}
+
+// [uint16 relLen][rel][content] — the real path travels inside the ciphertext.
+function packEntry(rel, content) {
+	const relBuf = Buffer.from(rel, "utf8");
+	if (relBuf.length > 0xffff) fail(`path too long to encrypt: ${rel}`);
+	const header = Buffer.alloc(2);
+	header.writeUInt16BE(relBuf.length, 0);
+	return Buffer.concat([header, relBuf, content]);
+}
+
+function unpackEntry(buf) {
+	const relLen = buf.readUInt16BE(0);
+	return { rel: buf.subarray(2, 2 + relLen).toString("utf8"), content: buf.subarray(2 + relLen) };
+}
+
+const dataKeyCachePath = () => path.join(TOOL_DIR, "datakey");
+
+async function hiddenPrompt(label) {
+	if (!process.stdin.isTTY) fail("a passphrase is required; set CLAUDE_SYNC_PASSPHRASE or run in a terminal");
+	process.stdout.write(label);
+	process.stdin.setRawMode(true);
+	process.stdin.resume();
+	process.stdin.setEncoding("utf8");
+	let value = "";
+	try {
+		return await new Promise((resolve, reject) => {
+			const onData = (chunk) => {
+				for (const ch of chunk) {
+					if (ch === "\u0003") {
+						process.stdin.off("data", onData);
+						reject(new Error("cancelled"));
+						return;
+					}
+					if (ch === "\r" || ch === "\n") {
+						process.stdin.off("data", onData);
+						resolve(value);
+						return;
+					}
+					if (ch === "\u007f" || ch === "\b") {
+						if (value.length) {
+							value = value.slice(0, -1);
+							process.stdout.write("\b \b");
+						}
+						continue;
+					}
+					value += ch;
+					process.stdout.write("•");
+				}
+			};
+			process.stdin.on("data", onData);
+		});
+	} finally {
+		process.stdin.setRawMode(false);
+		process.stdin.pause();
+		process.stdout.write("\n");
+	}
+}
+
+// Resolve the data key: cached locally, else from the passphrase (env or prompt).
+async function resolveKeys(cfg, { confirm = false, askPassphrase = hiddenPrompt } = {}) {
+	if (!cfg.encryption?.enabled) return null;
+
+	const cached = readIfExists(dataKeyCachePath());
+	if (cached && cached.length === 32) return expandKeys(cached);
+
+	const raw = readIfExists(keyringPath(cfg));
+	let dataKey;
+	if (raw) {
+		const passphrase = process.env.CLAUDE_SYNC_PASSPHRASE || (await askPassphrase("Passphrase for this store: "));
+		if (!passphrase) fail("no passphrase given");
+		dataKey = unwrapKeyring(JSON.parse(raw.toString("utf8")), passphrase);
+	} else {
+		// First encrypted push: mint the keyring.
+		let passphrase = process.env.CLAUDE_SYNC_PASSPHRASE;
+		if (!passphrase) {
+			passphrase = await askPassphrase("Choose a passphrase for this store: ");
+			if (!passphrase) fail("no passphrase given");
+			if (confirm) {
+				const again = await askPassphrase("Confirm passphrase: ");
+				if (again !== passphrase) fail("passphrases did not match");
+			}
+		}
+		if (passphrase.length < 8) fail("use a passphrase of at least 8 characters");
+		const created = createKeyring(passphrase);
+		fs.mkdirSync(path.dirname(keyringPath(cfg)), { recursive: true });
+		writeAtomic(keyringPath(cfg), Buffer.from(`${JSON.stringify(created.keyring, null, 2)}\n`, "utf8"));
+		dataKey = created.dataKey;
+		log.dim("created an encrypted store — keep this passphrase, it cannot be recovered");
+	}
+
+	// Cached so routine push/pull do not re-prompt. This is no weaker than the
+	// plaintext config already sitting in ~/.claude: it guards the cloud copy,
+	// not this machine.
+	writeAtomic(dataKeyCachePath(), dataKey);
+	try {
+		fs.chmodSync(dataKeyCachePath(), 0o600);
+	} catch {}
+	return expandKeys(dataKey);
+}
+
+function expandKeys(dataKey) {
+	return {
+		dataKey,
+		content: subkey(dataKey, "claude-sync/content/v1"),
+		paths: subkey(dataKey, "claude-sync/paths/v1"),
+		log: subkey(dataKey, "claude-sync/log/v1"),
+	};
+}
+
+// ---------------------------------------------------------------- store access
+
+function storeMetaPath(cfg) {
+	return path.join(storeDir(cfg), "store.json");
+}
+
+function readStoreMeta(cfg) {
+	const raw = readIfExists(storeMetaPath(cfg));
+	return raw ? JSON.parse(raw.toString("utf8")) : null;
+}
+
+function writeStoreMeta(cfg) {
+	if (readStoreMeta(cfg)) return;
+	writeAtomic(
+		storeMetaPath(cfg),
+		Buffer.from(`${JSON.stringify({ version: 1, encrypted: !!cfg.encryption?.enabled }, null, 2)}\n`, "utf8"),
+	);
+}
+
+// Refuse to read an encrypted store as plaintext, or vice versa.
+function assertStoreMatchesConfig(cfg) {
+	const meta = readStoreMeta(cfg);
+	if (!meta) return;
+	const wantEncrypted = !!cfg.encryption?.enabled;
+	if (meta.encrypted === wantEncrypted) return;
+	fail(
+		meta.encrypted
+			? "this store is encrypted, but encryption is off locally — re-run init with --encrypt"
+			: "this store is NOT encrypted, but encryption is on locally — use a new store, or re-run init without --encrypt",
+	);
+}
+
+// One interface over both layouts, so push/pull/status need no crypto awareness.
+function openStore(cfg, keys) {
+	const root = storeDir(cfg);
+	if (!keys) {
+		const base = path.join(root, "payload", "claude");
+		return {
+			readAll() {
+				const map = new Map();
+				for (const rel of walk(base)) {
+					const buf = readIfExists(path.join(base, rel));
+					if (buf) map.set(rel, buf);
+				}
+				return map;
+			},
+			write(rel, buf) {
+				writeAtomic(path.join(base, rel), buf);
+			},
+		};
+	}
+
+	const base = path.join(root, "payload");
+	return {
+		readAll() {
+			const map = new Map();
+			for (const name of walk(base)) {
+				if (!name.endsWith(".bin")) continue;
+				const blob = readIfExists(path.join(base, name));
+				if (!blob) continue;
+				let plain;
+				try {
+					plain = unseal(keys.content, blob, Buffer.from(name));
+				} catch {
+					log.warn(`skipping unreadable store entry ${name} (wrong key or tampered)`);
+					continue;
+				}
+				const { rel, content } = unpackEntry(plain);
+				map.set(rel, Buffer.from(content));
+			}
+			return map;
+		},
+		write(rel, buf) {
+			const name = blobName(keys.paths, rel);
+			writeAtomic(path.join(base, name), seal(keys.content, packEntry(rel, buf), Buffer.from(name)));
+		},
+	};
+}
+
 // ---------------------------------------------------------------- config
 
 function loadConfig({ required = true } = {}) {
@@ -342,27 +618,30 @@ function logPath(cfg) {
 	return path.join(storeDir(cfg), "logs", "sync-log.jsonl");
 }
 
-function appendLog(cfg, entry) {
+// Each line is independent, so appending stays safe from several machines, and
+// an encrypted log can still be appended to without rewriting what is there.
+function appendLog(cfg, entry, keys) {
 	const p = logPath(cfg);
 	fs.mkdirSync(path.dirname(p), { recursive: true });
-	fs.appendFileSync(p, `${JSON.stringify(entry)}\n`, "utf8");
+	const json = JSON.stringify(entry);
+	const line = keys ? seal(keys.log, Buffer.from(json, "utf8"), AAD_LOG).toString("base64") : json;
+	fs.appendFileSync(p, `${line}\n`, "utf8");
 }
 
-function readLog(cfg) {
+function readLog(cfg, keys) {
 	const raw = readIfExists(logPath(cfg));
 	if (!raw) return [];
-	return raw
-		.toString("utf8")
-		.split("\n")
-		.filter(Boolean)
-		.map((l) => {
-			try {
-				return JSON.parse(l);
-			} catch {
-				return null;
-			}
-		})
-		.filter(Boolean);
+	const out = [];
+	for (const line of raw.toString("utf8").split("\n")) {
+		if (!line.trim()) continue;
+		try {
+			if (keys) out.push(JSON.parse(unseal(keys.log, Buffer.from(line, "base64"), AAD_LOG).toString("utf8")));
+			else out.push(JSON.parse(line));
+		} catch {
+			out.push({ id: "????????", op: "?", machine: "(unreadable)", at: new Date(0).toISOString(), counts: {}, files: [] });
+		}
+	}
+	return out;
 }
 
 // ---------------------------------------------------------------- engine
@@ -377,14 +656,15 @@ function localFiles(cfg) {
 	return out.sort();
 }
 
-function doPush(cfg, { dryRun }) {
+function doPush(cfg, keys, { dryRun }) {
 	backends[cfg.backend.type].prepare(cfg);
-	const dest = payloadDir(cfg);
+	assertStoreMatchesConfig(cfg);
+	const store = openStore(cfg, keys);
+	const current = store.readAll();
 	const actions = [];
 
 	for (const rel of localFiles(cfg)) {
-		const src = path.join(CLAUDE_DIR, rel);
-		let buf = readIfExists(src);
+		let buf = readIfExists(path.join(CLAUDE_DIR, rel));
 		if (!buf) continue;
 
 		const secret = scanSecrets(buf);
@@ -394,34 +674,32 @@ function doPush(cfg, { dryRun }) {
 		}
 		if (REWRITE.has(rel)) buf = tokenize(buf);
 
-		const target = path.join(dest, rel);
-		const existing = readIfExists(target);
-		const hash = sha256(buf);
-		if (existing && sha256(existing) === hash) {
-			actions.push({ file: rel, action: "unchanged", hash });
+		const existing = current.get(rel);
+		if (existing && sha256(existing) === sha256(buf)) {
+			actions.push({ file: rel, action: "unchanged" });
 			continue;
 		}
-		if (!dryRun) writeAtomic(target, buf);
-		actions.push({ file: rel, action: existing ? "updated" : "added", hash, bytes: buf.length });
+		if (!dryRun) store.write(rel, buf);
+		actions.push({ file: rel, action: existing ? "updated" : "added", bytes: buf.length });
 	}
+	if (!dryRun) writeStoreMeta(cfg);
 	return actions;
 }
 
-function doPull(cfg, { dryRun, prune }) {
+function doPull(cfg, keys, { dryRun, prune }) {
 	backends[cfg.backend.type].prepare(cfg);
 	backends[cfg.backend.type].refresh(cfg);
-	const src = payloadDir(cfg);
-	if (!fs.existsSync(src)) fail(`store has no payload yet at ${src} — run push on another machine first`);
+	assertStoreMatchesConfig(cfg);
+
+	const incoming = openStore(cfg, keys).readAll();
+	if (!incoming.size) fail("the store has no files yet — run push on the machine you want to copy from");
 
 	const actions = [];
-	const incoming = walk(src).sort();
-
 	const backupId = new Date().toISOString().replace(/[:.]/g, "-");
 	const backupRoot = path.join(BACKUP_DIR, backupId);
 
-	for (const rel of incoming) {
-		let buf = readIfExists(path.join(src, rel));
-		if (!buf) continue;
+	for (const rel of [...incoming.keys()].sort()) {
+		let buf = incoming.get(rel);
 		if (REWRITE.has(rel)) buf = detokenize(buf);
 
 		const target = path.join(CLAUDE_DIR, rel);
@@ -438,9 +716,8 @@ function doPull(cfg, { dryRun, prune }) {
 	}
 
 	if (prune) {
-		const incomingSet = new Set(incoming);
 		for (const rel of localFiles(cfg)) {
-			if (incomingSet.has(rel)) continue;
+			if (incoming.has(rel)) continue;
 			if (!dryRun) {
 				const existing = readIfExists(path.join(CLAUDE_DIR, rel));
 				if (existing) writeAtomic(path.join(backupRoot, rel), existing);
@@ -592,7 +869,13 @@ export async function interactiveInit(ask) {
 		const wantTranscripts = (await ask("Include session transcripts? [y/N] ")).trim().toLowerCase();
 		const transcripts = wantTranscripts === "y" || wantTranscripts === "yes";
 
-		return { backend, machine, transcripts };
+		log.dim("\nEncryption scrambles the files before they leave this machine, so whoever");
+		log.dim("holds the store — Dropbox, OneDrive, GitHub — only ever sees ciphertext.");
+		log.dim("You will need the passphrase on every machine. It cannot be recovered.");
+		const wantEncryption = (await ask("Encrypt the stored files? [Y/n] ")).trim().toLowerCase();
+		const encrypt = !(wantEncryption === "n" || wantEncryption === "no");
+
+		return { backend, machine, transcripts, encrypt };
 	} finally {
 		if (rl) rl.close();
 	}
@@ -624,6 +907,7 @@ const commands = {
 						: { type, remote: args.remote === true ? null : args.remote || null },
 				machine: args.machine && args.machine !== true ? args.machine : os.hostname(),
 				transcripts: !!args.transcripts,
+				encrypt: !!args.encrypt,
 			};
 		}
 
@@ -632,9 +916,18 @@ const commands = {
 			backend: chosen.backend,
 			machine: chosen.machine,
 			include: { transcripts: chosen.transcripts },
+			encryption: { enabled: !!chosen.encrypt, cipher: "aes-256-gcm", kdf: "scrypt" },
 			created: new Date().toISOString(),
 		};
 		backends[cfg.backend.type].prepare(cfg);
+
+		// An existing store decides the matter: joining an encrypted one requires
+		// encryption, and vice versa.
+		const meta = readStoreMeta(cfg);
+		if (meta && meta.encrypted !== cfg.encryption.enabled) {
+			cfg.encryption.enabled = meta.encrypted;
+			log.warn(`this store is already ${meta.encrypted ? "encrypted" : "unencrypted"} — matching it`);
+		}
 		saveConfig(cfg);
 
 		log.info("");
@@ -642,6 +935,7 @@ const commands = {
 		if (cfg.backend.type === "folder")
 			log.dim("your cloud client syncs that folder — nothing else to set up");
 		log.dim(`machine: ${cfg.machine}   transcripts: ${cfg.include.transcripts ? "included" : "excluded"}`);
+		log.dim(`encryption: ${cfg.encryption.enabled ? "on (AES-256-GCM)" : "off"}`);
 		log.dim(`config:  ${CONFIG_PATH}`);
 		log.info("");
 		log.info("Next:  claude-sync push          (send this machine's config to the store)");
@@ -668,11 +962,13 @@ const commands = {
 		log.info("Next: claude-sync push");
 	},
 
-	push(args) {
+	async push(args) {
 		const cfg = loadConfig();
 		const started = Date.now();
-		log.head(`Pushing from ${cfg.machine} → ${cfg.backend.type}`);
-		const actions = doPush(cfg, { dryRun: args["dry-run"] });
+		backends[cfg.backend.type].prepare(cfg);
+		const keys = await resolveKeys(cfg, { confirm: true });
+		log.head(`Pushing from ${cfg.machine} → ${cfg.backend.type}${keys ? " (encrypted)" : ""}`);
+		const actions = doPush(cfg, keys, { dryRun: args["dry-run"] });
 		printActions(actions, { verbose: args.verbose });
 
 		if (args["dry-run"]) {
@@ -689,18 +985,21 @@ const commands = {
 			counts: summarize(actions),
 			files: actions.filter((a) => a.action !== "unchanged"),
 		};
-		appendLog(cfg, entry);
+		appendLog(cfg, entry, keys);
 		backends[cfg.backend.type].finalize(cfg, `claude-sync push from ${cfg.machine} (${entry.id})`);
 		cfg.lastPush = entry.at;
 		saveConfig(cfg);
 		log.ok(`push complete (${entry.id})`);
 	},
 
-	pull(args) {
+	async pull(args) {
 		const cfg = loadConfig();
 		const started = Date.now();
-		log.head(`Pulling into ${cfg.machine} ← ${cfg.backend.type}`);
-		const { actions, backupId } = doPull(cfg, { dryRun: args["dry-run"], prune: args.prune });
+		backends[cfg.backend.type].prepare(cfg);
+		backends[cfg.backend.type].refresh(cfg);
+		const keys = await resolveKeys(cfg);
+		log.head(`Pulling into ${cfg.machine} ← ${cfg.backend.type}${keys ? " (encrypted)" : ""}`);
+		const { actions, backupId } = doPull(cfg, keys, { dryRun: args["dry-run"], prune: args.prune });
 		printActions(actions, { verbose: args.verbose });
 
 		if (args["dry-run"]) {
@@ -719,7 +1018,7 @@ const commands = {
 			counts: summarize(actions),
 			files: actions.filter((a) => a.action !== "unchanged"),
 		};
-		appendLog(cfg, entry);
+		appendLog(cfg, entry, keys);
 		if (cfg.backend.type === "git") backends.git.finalize(cfg, `claude-sync pull log from ${cfg.machine} (${entry.id})`);
 		cfg.lastPull = entry.at;
 		saveConfig(cfg);
@@ -728,25 +1027,26 @@ const commands = {
 			log.info("marketplaces changed — run /plugin in Claude Code to install the plugins they declare");
 	},
 
-	status() {
+	async status() {
 		const cfg = loadConfig();
 		backends[cfg.backend.type].prepare(cfg);
+		const keys = await resolveKeys(cfg);
 		log.head(`claude-sync status — ${cfg.machine}`);
-		log.info(`backend:  ${cfg.backend.type}  (${cfg.backend.path || cfg.backend.remote || "local only"})`);
-		log.info(`store:    ${storeDir(cfg)}`);
+		log.info(`backend:   ${cfg.backend.type}  (${cfg.backend.path || cfg.backend.remote || "local only"})`);
+		log.info(`store:     ${storeDir(cfg)}`);
+		log.info(`encrypted: ${keys ? "yes — AES-256-GCM, passphrase-derived key" : "no"}`);
 		log.info(`last push: ${cfg.lastPush || "never"}`);
 		log.info(`last pull: ${cfg.lastPull || "never"}`);
 
-		const pending = doPush(cfg, { dryRun: true });
+		const pending = doPush(cfg, keys, { dryRun: true });
 		log.head("Local → store (pending push)");
 		printActions(pending, { verbose: false });
 
-		const store = payloadDir(cfg);
-		if (fs.existsSync(store)) {
+		const incoming = openStore(cfg, keys).readAll();
+		if (incoming.size) {
 			const drift = [];
-			for (const rel of walk(store)) {
-				let buf = readIfExists(path.join(store, rel));
-				if (!buf) continue;
+			for (const rel of [...incoming.keys()].sort()) {
+				let buf = incoming.get(rel);
 				if (REWRITE.has(rel)) buf = detokenize(buf);
 				const local = readIfExists(path.join(CLAUDE_DIR, rel));
 				if (!local) drift.push({ file: rel, action: "added" });
@@ -757,9 +1057,10 @@ const commands = {
 		}
 	},
 
-	log(args) {
+	async log(args) {
 		const cfg = loadConfig();
-		let entries = readLog(cfg);
+		const keys = await resolveKeys(cfg);
+		let entries = readLog(cfg, keys);
 		if (args.machine) entries = entries.filter((e) => e.machine === args.machine);
 		if (args.op) entries = entries.filter((e) => e.op === args.op);
 		if (args.since) {
@@ -824,6 +1125,15 @@ const commands = {
 			const dir = storeDir(cfg);
 			log.info(`store:      ${dir} ${fs.existsSync(dir) ? "(reachable)" : "(MISSING — is your cloud drive mounted?)"}`);
 			log.info(`transcripts: ${cfg.include?.transcripts ? "included" : "excluded (opt-in)"}`);
+			if (cfg.encryption?.enabled) {
+				const haveKeyring = fs.existsSync(keyringPath(cfg));
+				const cached = readIfExists(dataKeyCachePath());
+				log.info("encryption: on — AES-256-GCM, contents and filenames");
+				log.info(`  keyring:  ${haveKeyring ? keyringPath(cfg) : "not created yet (first push will make it)"}`);
+				log.info(`  key:      ${cached?.length === 32 ? "cached locally, no passphrase needed" : "will prompt for the passphrase"}`);
+			} else {
+				log.info("encryption: off — files are readable by whoever can read the store");
+			}
 		}
 
 		const files = cfg ? localFiles(cfg) : localFiles({ include: {} });
@@ -863,7 +1173,12 @@ Usage
   claude-sync init                                   asks where to store your files
   claude-sync init --backend folder --path <dir>     or name it outright: any synced dir
   claude-sync init --backend git --remote <url>      or a GitHub/GitLab repo
-      [--machine <name>] [--transcripts] [--force]
+      [--machine <name>] [--transcripts] [--encrypt] [--force]
+
+  Encryption (--encrypt) seals file contents AND filenames with AES-256-GCM
+  before anything leaves the machine, under a key derived from a passphrase you
+  choose. The passphrase cannot be recovered. Set CLAUDE_SYNC_PASSPHRASE to
+  avoid the prompt in scripts.
 
   claude-sync remote --url <git-url>                 attach/change the git remote later
 

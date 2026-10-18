@@ -25,7 +25,7 @@ console.log(`detected ${detected.length} cloud drive(s): ${detected.map((d) => d
 
 // 1) Pick the first detected drive, accept the suggested path.
 if (detected.length) {
-	const r = await interactiveInit(scripted(["1", "y", "desktop", "n"]));
+	const r = await interactiveInit(scripted(["1", "y", "desktop", "n", "y"]));
 	check("picking a detected drive yields a folder backend", r.backend.type === "folder", JSON.stringify(r.backend));
 	check(
 		"suggested path is <drive>/claude-sync",
@@ -39,7 +39,7 @@ if (detected.length) {
 // 2) Decline the suggestion and type a custom folder.
 if (detected.length) {
 	const custom = path.join(os.tmpdir(), "my-claude-store");
-	const r = await interactiveInit(scripted(["1", "n", custom, "", "y"]));
+	const r = await interactiveInit(scripted(["1", "n", custom, "", "y", "y"]));
 	check("declining the suggestion lets you type a path", r.backend.path === path.resolve(custom), r.backend.path);
 	check("blank machine name falls back to hostname", r.machine === os.hostname(), r.machine);
 	check("transcripts can be opted in", r.transcripts === true);
@@ -47,29 +47,40 @@ if (detected.length) {
 
 // 3) "Another folder" option, with ~ expansion.
 const another = String(detected.length + 1);
-const r3 = await interactiveInit(scripted([another, "~/claude-store", "laptop", "n"]));
+const r3 = await interactiveInit(scripted([another, "~/claude-store", "laptop", "n", "y"]));
 check("'another folder' accepts a typed path", r3.backend.type === "folder", JSON.stringify(r3.backend));
 check("a leading ~ is expanded to home", r3.backend.path === path.join(HOME, "claude-store"), r3.backend.path);
 
 // 4) Git option with a remote.
 const gitChoice = String(detected.length + 2);
-const r4 = await interactiveInit(scripted([gitChoice, "git@github.com:me/ai-config.git", "desktop", "n"]));
+const r4 = await interactiveInit(scripted([gitChoice, "git@github.com:me/ai-config.git", "desktop", "n", "y"]));
 check("git option yields a git backend", r4.backend.type === "git", JSON.stringify(r4.backend));
 check("git remote is captured", r4.backend.remote === "git@github.com:me/ai-config.git", r4.backend.remote);
 
 // 5) Git option with no remote yet (store stays local).
-const r5 = await interactiveInit(scripted([gitChoice, "", "desktop", "n"]));
+const r5 = await interactiveInit(scripted([gitChoice, "", "desktop", "n", "y"]));
 check("git with a blank remote is allowed", r5.backend.type === "git" && r5.backend.remote === null, JSON.stringify(r5.backend));
 
 // 6) Invalid menu input is re-prompted rather than accepted.
-const r6 = await interactiveInit(scripted(["99", "abc", "", gitChoice, "", "host", "n"]));
+const r6 = await interactiveInit(scripted(["99", "abc", "", gitChoice, "", "host", "n", "y"]));
 check("invalid menu choices are re-prompted", r6.backend.type === "git", JSON.stringify(r6.backend));
 
 // 7) Transcript prompt only accepts an explicit yes.
-const r7 = await interactiveInit(scripted([gitChoice, "", "h", "yes"]));
+const r7 = await interactiveInit(scripted([gitChoice, "", "h", "yes", "y"]));
 check("'yes' opts transcripts in", r7.transcripts === true);
-const r8 = await interactiveInit(scripted([gitChoice, "", "h", "whatever"]));
+const r8 = await interactiveInit(scripted([gitChoice, "", "h", "whatever", "y"]));
 check("an unclear transcript answer stays excluded", r8.transcripts === false);
+
+// 8) Encryption is the default, and only an explicit no turns it off.
+check("encryption is on when answered yes", r7.encrypt === true);
+const e1 = await interactiveInit(scripted([gitChoice, "", "h", "n", ""]));
+check("blank answer keeps encryption on (it is the default)", e1.encrypt === true);
+const e2 = await interactiveInit(scripted([gitChoice, "", "h", "n", "n"]));
+check("'n' turns encryption off", e2.encrypt === false);
+const e3 = await interactiveInit(scripted([gitChoice, "", "h", "n", "no"]));
+check("'no' turns encryption off", e3.encrypt === false);
+const e4 = await interactiveInit(scripted([gitChoice, "", "h", "n", "Y"]));
+check("'Y' keeps encryption on", e4.encrypt === true);
 
 console.log(failures ? `\n${failures} check(s) failed` : "\nall checks passed");
 process.exit(failures ? 1 : 0);
