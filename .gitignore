@@ -1,0 +1,6 @@
+node_modules/
+*.log
+
+# Local test output
+.test-out/
+e2e/

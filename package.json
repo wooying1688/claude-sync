@@ -1,0 +1,30 @@
+{
+  "name": "claude-sync",
+  "version": "1.0.0",
+  "description": "Sync your Claude Code setup across machines, stored wherever you choose — any cloud drive or a git repo — with reviewable sync logs.",
+  "type": "module",
+  "bin": {
+    "claude-sync": "claude-sync.mjs"
+  },
+  "main": "claude-sync.mjs",
+  "files": [
+    "claude-sync.mjs",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "node test-roundtrip.mjs && node test-interactive.mjs && node test-e2e.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "claude",
+    "claude-code",
+    "sync",
+    "dotfiles",
+    "config",
+    "backup"
+  ],
+  "license": "MIT",
+  "dependencies": {}
+}
